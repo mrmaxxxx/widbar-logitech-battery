@@ -1,0 +1,119 @@
+name: Build Logitech Battery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Build package
+        shell: pwsh
+        run: |
+          $project = Join-Path $env:GITHUB_WORKSPACE 'templates\standalone\WidBarWidget1 (Package)\WidBarWidget1 (Package).wapproj'
+          $output = Join-Path $env:GITHUB_WORKSPACE 'AppPackages'
+
+          msbuild $project /restore /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:RuntimeIdentifier=win-x64 `
+            /p:AppxBundle=Never `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /p:GenerateAppxPackageOnBuild=true `
+            /p:AppxPackageSigningEnabled=false `
+            "/p:AppxPackageDir=$output\"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed. See MSBuild output above."
+          }
+
+      - name: Sign package
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:GITHUB_WORKSPACE 'AppPackages'
+          $packages = @(Get-ChildItem $output -Recurse -File |
+            Where-Object {
+              $_.Extension -in '.msix', '.appx' -and
+              $_.FullName -notmatch '[\\/]Dependencies[\\/]'
+            })
+
+          if ($packages.Count -eq 0) {
+            throw "No application package was generated."
+          }
+
+          $cert = New-SelfSignedCertificate `
+            -Type Custom `
+            -Subject 'CN=Developer' `
+            -FriendlyName 'Logitech Battery Test Certificate' `
+            -KeyUsage DigitalSignature `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256 `
+            -KeyExportPolicy Exportable `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -TextExtension @(
+              '2.5.29.37={text}1.3.6.1.5.5.7.3.3',
+              '2.5.29.19={text}'
+            )
+
+          $pfx = Join-Path $env:RUNNER_TEMP 'widget-signing.pfx'
+          $passwordText = [Guid]::NewGuid().ToString()
+          $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
+
+          Export-PfxCertificate -Cert $cert -FilePath $pfx `
+            -Password $password | Out-Null
+
+          Export-Certificate -Cert $cert `
+            -FilePath (Join-Path $output 'LogitechBattery.cer') |
+            Out-Null
+
+          $sdkBin = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $signTool = Get-ChildItem "$sdkBin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $signTool) {
+            throw "SignTool not found."
+          }
+
+          try {
+            foreach ($package in $packages) {
+              & $signTool.FullName sign /fd SHA256 `
+                /f $pfx /p $passwordText $package.FullName
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "Package signing failed."
+              }
+
+              & $signTool.FullName verify /pa $package.FullName
+              # Trust is installed later on the user's PC.
+            }
+          }
+          finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload installation files
+        uses: actions/upload-artifact@v4
+        with:
+          name: LogitechBattery-x64
+          path: AppPackages/
+          if-no-files-found: error
+          retention-days: 7
