@@ -1,230 +1,259 @@
-using System.Text.Json;
+using System;
+using System.Globalization;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Linq;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using WidBar.SDK;
 
 namespace WidBarWidget1.ExtensionApp;
 
-// Sample widget: a clock on the taskbar, a bigger clock in the flyout and a
-// 12/24h toggle in settings. Replace the UI with your own. This code runs in
-// its own process, so feel free to pull in any NuGet or native dependency.
 public sealed class MainPlugin :
     WidgetPluginBase,
-    IConfigurableWidgetPlugin,
     IWidgetFlyoutLifecycle
 {
-    private Settings _settings = new();
+    private readonly HttpClient _http = new()
+    {
+        Timeout = TimeSpan.FromSeconds(3)
+    };
+
+    private readonly CancellationTokenSource _shutdown = new();
+    private DispatcherTimer? _timer;
     private TextBlock? _previewText;
     private TextBlock? _flyoutText;
-    private DispatcherTimer? _previewTimer;
-    private DispatcherTimer? _flyoutTimer;
 
-    // Catalog metadata (description, category, version) lives in the .csproj
-    // WidBarPlugin* properties -> plugin.json, the single source the WidBar
-    // catalog reads. The plugin class only carries what the runtime needs.
+    private BatteryInfo? _mouse;
+    private BatteryInfo? _headset;
+    private bool _updating;
+    private bool _flyoutVisible;
+    private bool _disposed;
+
     public override string Id => "com.example.mywidget";
-    public override string Name => "MY-WIDGET-DISPLAY-NAME";
+    public override string Name => "Logitech Battery";
 
-    public override int PreviewLogicalWidth => 150;
+    public override int PreviewLogicalWidth => 190;
     public override int FlyoutWidth => 360;
-    public override int FlyoutHeight => 240;
-    public override WidgetFlyoutBackdrop FlyoutBackdrop => WidgetFlyoutBackdrop.Acrylic;
+    public override int FlyoutHeight => 220;
+    public override WidgetFlyoutBackdrop FlyoutBackdrop =>
+        WidgetFlyoutBackdrop.Acrylic;
 
-    private sealed class Settings
-    {
-        public bool Use24h { get; set; } = true;
-
-        public static Settings FromJson(string? json)
-        {
-            try
-            {
-                return string.IsNullOrWhiteSpace(json)
-                    ? new Settings()
-                    : JsonSerializer.Deserialize<Settings>(json) ?? new Settings();
-            }
-            catch
-            {
-                return new Settings();
-            }
-        }
-
-        public string ToJson() => JsonSerializer.Serialize(this);
-    }
-
-    private string TimeText => DateTime.Now.ToString(_settings.Use24h ? "HH:mm:ss" : "hh:mm:ss tt");
+    private sealed record BatteryInfo(
+        decimal Percent,
+        bool Charging,
+        string LastUpdate);
 
     public override async Task InitializeAsync(IWidgetContext context)
     {
-        _settings = Settings.FromJson(context.SettingsJson);
         await base.InitializeAsync(context);
         context.PreviewVisibilityChanged += OnPreviewVisibilityChanged;
     }
 
-    // Taskbar preview. Return a compact WinUI element sized for a taskbar slot.
-    // Hover, placement and click-to-open are handled on the WidBar side.
     public override UIElement? CreatePreviewContent()
     {
         _previewText = new TextBlock
         {
-            Text = TimeText,
+            Text = PreviewText(),
             FontSize = 16,
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
         };
 
-        var root = new Grid
-        {
-            Background = null,
-        };
+        var root = new Grid { Background = null };
         root.Children.Add(_previewText);
 
-        _previewTimer?.Stop();
-        _previewTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-        _previewTimer.Tick += OnPreviewTimerTick;
-        SetPreviewUpdatesEnabled(Context?.IsPreviewVisible ?? true);
+        if (_timer is null)
+        {
+            _timer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(10)
+            };
+            _timer.Tick += OnTimerTick;
+        }
 
+        UpdateTimer();
+        _ = RefreshAsync();
         return root;
     }
 
-    // Flyout shown when the user clicks the preview. This is a real window,
-    // so anything goes: scrolling, input, Win2D, whatever you need.
     public override UIElement? CreateFlyoutContent()
     {
         _flyoutText = new TextBlock
         {
-            Text = TimeText,
-            FontSize = 40,
-            HorizontalAlignment = HorizontalAlignment.Center,
+            Text = FlyoutText(),
+            FontSize = 16,
+            TextWrapping = TextWrapping.Wrap
         };
-
-        _flyoutTimer?.Stop();
-        _flyoutTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-        _flyoutTimer.Tick += OnFlyoutTimerTick;
 
         var panel = new StackPanel
         {
             Spacing = 12,
-            Padding = new Thickness(24),
-            VerticalAlignment = VerticalAlignment.Center,
+            Padding = new Thickness(20)
         };
-        panel.Children.Add(_flyoutText);
+
         panel.Children.Add(new TextBlock
         {
-            Text = "MY-WIDGET-DISPLAY-NAME",
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Opacity = 0.6,
+            Text = "Logitech Battery",
+            FontSize = 20,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
         });
+        panel.Children.Add(_flyoutText);
 
         return panel;
     }
 
-    // Settings UI. The SDK hosts it in a window with Save/Cancel buttons and
-    // opens it from the WidBar app or from the gear in the flyout. Call
-    // SaveSettings on every change so the draft stays current.
-    public UIElement? CreateSettingsContent(IWidgetSettingsContext context)
+    private static string Percentage(BatteryInfo? battery)
     {
-        var draft = Settings.FromJson(context.SettingsJson);
+        if (battery is null)
+            return "—";
 
-        var toggle = new ToggleSwitch
-        {
-            Header = "Use 24-hour clock",
-            IsOn = draft.Use24h,
-        };
-        toggle.Toggled += (_, _) =>
-        {
-            draft.Use24h = toggle.IsOn;
-            context.SaveSettings(draft.ToJson());
-            context.RequestPreviewRefresh();
-        };
+        string value = Math.Round(battery.Percent)
+            .ToString("0", CultureInfo.InvariantCulture);
 
-        var panel = new StackPanel { Spacing = 16 };
-        panel.Children.Add(toggle);
-        return panel;
+        return value + "%" + (battery.Charging ? " ⚡" : "");
     }
 
-    // Called while the user edits settings (and again with the original JSON
-    // if they cancel). Apply the draft so the taskbar preview updates live.
-    public override void OnSettingsDraftChanged(string settingsJson)
+    private string PreviewText() =>
+        $"🖱 {Percentage(_mouse)}   🎧 {Percentage(_headset)}";
+
+    private string FlyoutText() =>
+        $"🖱 G502 X PLUS: {Percentage(_mouse)}\n" +
+        $"Обновление источника: {_mouse?.LastUpdate ?? "нет данных"}\n\n" +
+        $"🎧 PRO X Wireless: {Percentage(_headset)}\n" +
+        $"Обновление источника: {_headset?.LastUpdate ?? "нет данных"}";
+
+    private async Task<BatteryInfo?> ReadBatteryAsync(string deviceId)
     {
-        _settings = Settings.FromJson(settingsJson);
+        try
+        {
+            string xml = await _http.GetStringAsync(
+                $"http://localhost:12321/device/{deviceId}",
+                _shutdown.Token);
+
+            var root = XDocument.Parse(xml).Root;
+            if (root is null)
+                return null;
+
+            if (!decimal.TryParse(
+                root.Element("battery_percent")?.Value,
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out decimal percent))
+            {
+                return null;
+            }
+
+            if (percent < 0 || percent > 100)
+                return null;
+
+            bool.TryParse(
+                root.Element("charging")?.Value,
+                out bool charging);
+
+            return new BatteryInfo(
+                percent,
+                charging,
+                root.Element("last_update")?.Value ?? "неизвестно");
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task RefreshAsync()
+    {
+        if (_updating || _disposed)
+            return;
+
+        _updating = true;
+        try
+        {
+            var mouseTask = ReadBatteryAsync("dev00000004");
+            var headsetTask = ReadBatteryAsync("dev00000003");
+
+            await Task.WhenAll(mouseTask, headsetTask);
+
+            if (_disposed)
+                return;
+
+            _mouse = await mouseTask;
+            _headset = await headsetTask;
+            UpdateText();
+        }
+        finally
+        {
+            _updating = false;
+        }
+    }
+
+    private void UpdateText()
+    {
         if (_previewText is not null)
-        {
-            _previewText.Text = TimeText;
-        }
+            _previewText.Text = PreviewText();
 
         if (_flyoutText is not null)
-        {
-            _flyoutText.Text = TimeText;
-        }
+            _flyoutText.Text = FlyoutText();
     }
 
-    public void OnFlyoutShown()
+    private void UpdateTimer()
     {
-        if (_flyoutText is not null)
-        {
-            _flyoutText.Text = TimeText;
-        }
+        if (_disposed || _timer is null)
+            return;
 
-        _flyoutTimer?.Start();
-    }
-
-    public void OnFlyoutHidden()
-    {
-        _flyoutTimer?.Stop();
-    }
-
-    public override ValueTask DisposeAsync()
-    {
-        if (Context is not null)
-        {
-            Context.PreviewVisibilityChanged -= OnPreviewVisibilityChanged;
-        }
-
-        _previewTimer?.Stop();
-        _flyoutTimer?.Stop();
-        _previewTimer = null;
-        _flyoutTimer = null;
-        _previewText = null;
-        _flyoutText = null;
-        return ValueTask.CompletedTask;
+        if ((Context?.IsPreviewVisible ?? true) || _flyoutVisible)
+            _timer.Start();
+        else
+            _timer.Stop();
     }
 
     private void OnPreviewVisibilityChanged(object? sender, bool isVisible)
     {
-        SetPreviewUpdatesEnabled(isVisible);
-    }
-
-    private void SetPreviewUpdatesEnabled(bool isVisible)
-    {
+        UpdateTimer();
         if (isVisible)
-        {
-            if (_previewText is not null)
-            {
-                _previewText.Text = TimeText;
-            }
-
-            _previewTimer?.Start();
-        }
-        else
-        {
-            _previewTimer?.Stop();
-        }
+            _ = RefreshAsync();
     }
 
-    private void OnPreviewTimerTick(object? sender, object e)
+    private async void OnTimerTick(object? sender, object e)
     {
-        if (_previewText is not null)
-        {
-            _previewText.Text = TimeText;
-        }
+        await RefreshAsync();
     }
 
-    private void OnFlyoutTimerTick(object? sender, object e)
+    public void OnFlyoutShown()
     {
-        if (_flyoutText is not null)
+        _flyoutVisible = true;
+        UpdateText();
+        UpdateTimer();
+        _ = RefreshAsync();
+    }
+
+    public void OnFlyoutHidden()
+    {
+        _flyoutVisible = false;
+        UpdateTimer();
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        _disposed = true;
+
+        if (Context is not null)
+            Context.PreviewVisibilityChanged -= OnPreviewVisibilityChanged;
+
+        if (_timer is not null)
         {
-            _flyoutText.Text = TimeText;
+            _timer.Stop();
+            _timer.Tick -= OnTimerTick;
         }
+
+        _shutdown.Cancel();
+        _http.Dispose();
+        _timer = null;
+        _previewText = null;
+        _flyoutText = null;
+
+        return ValueTask.CompletedTask;
     }
 }
