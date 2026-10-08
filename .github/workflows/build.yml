@@ -93,6 +93,11 @@ jobs:
             throw "SignTool not found."
           }
 
+                    Import-Certificate `
+            -FilePath (Join-Path $output 'LogitechBattery.cer') `
+            -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' |
+            Out-Null
+
           try {
             foreach ($package in $packages) {
               & $signTool.FullName sign /fd SHA256 `
@@ -102,8 +107,11 @@ jobs:
                 throw "Package signing failed."
               }
 
-              & $signTool.FullName verify /pa $package.FullName
-              # Trust is installed later on the user's PC.
+                            & $signTool.FullName verify /pa $package.FullName
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "Package signature verification failed."
+              }
             }
           }
           finally {
